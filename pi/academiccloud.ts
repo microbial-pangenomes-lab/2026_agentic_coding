@@ -21,10 +21,28 @@ function parseQwenToolCalls(
   text: string,
 ): { name: string; arguments: Record<string, any> }[] {
   const toolCalls: { name: string; arguments: Record<string, any> }[] = [];
-  const regex =
-    /<tool_call>\s*<function=(\w+)>([\s\S]*?)<\/function>\s*<\/tool_call>/g;
+
+  // Format 1: JSON inside <tool_call> — Qwen's native format
+  // <tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>
+  const jsonRegex = /<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
   let match;
-  while ((match = regex.exec(text)) !== null) {
+  while ((match = jsonRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (parsed.name) {
+        toolCalls.push({ name: parsed.name, arguments: parsed.arguments ?? parsed.parameters ?? {} });
+      }
+    } catch {
+      // ignore malformed JSON
+    }
+  }
+  if (toolCalls.length > 0) return toolCalls;
+
+  // Format 2: XML parameter format (legacy fallback)
+  // <tool_call><function=NAME><parameter=NAME>...</parameter></function></tool_call>
+  const xmlRegex =
+    /<tool_call>\s*<function=(\w+)>([\s\S]*?)<\/function>\s*<\/tool_call>/g;
+  while ((match = xmlRegex.exec(text)) !== null) {
     const funcName = match[1];
     const paramSection = match[2];
     const args: Record<string, any> = {};
@@ -209,19 +227,19 @@ function streamQwen35ToolFix(
 
       eventStream.push({ type: "start", partial: output });
 
-      // Emit thinking content
-      const reasoning = message?.reasoning_content ?? message?.reasoning;
-      if (reasoning) {
-        output.content.push({ type: "thinking", thinking: reasoning } as ThinkingContent);
-        const idx = output.content.length - 1;
-        eventStream.push({ type: "thinking_start", contentIndex: idx, partial: output });
-        eventStream.push({ type: "thinking_delta", contentIndex: idx, delta: reasoning, partial: output });
-        eventStream.push({ type: "thinking_end", contentIndex: idx, content: reasoning, partial: output });
-      }
-
       // Check for proper tool_calls from the API first
       const apiToolCalls = message?.tool_calls;
       if (apiToolCalls && apiToolCalls.length > 0) {
+        // Emit reasoning as thinking before tool calls if present
+        const preCallReasoning = message?.reasoning_content ?? message?.reasoning;
+        if (preCallReasoning && preCallReasoning.trim()) {
+          const thinkText = preCallReasoning.trim();
+          output.content.push({ type: "thinking", thinking: thinkText } as ThinkingContent);
+          const idx = output.content.length - 1;
+          eventStream.push({ type: "thinking_start", contentIndex: idx, partial: output });
+          eventStream.push({ type: "thinking_delta", contentIndex: idx, delta: thinkText, partial: output });
+          eventStream.push({ type: "thinking_end", contentIndex: idx, content: thinkText, partial: output });
+        }
         for (const tc of apiToolCalls) {
           let args: Record<string, any> = {};
           try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
@@ -239,42 +257,114 @@ function streamQwen35ToolFix(
         }
         output.stopReason = "toolUse";
         eventStream.push({ type: "done", reason: "toolUse", message: output });
-      } else if (message?.content) {
-        // Parse <tool_call> blocks from text content
-        const parsedToolCalls = parseQwenToolCalls(message.content);
+      } else {
+        // Check for reasoning field (Qwen 3.5/3.6 models put response in reasoning when content is null)
+        const reasoning = message?.reasoning_content ?? message?.reasoning;
+        const content = message?.content;
 
-        if (parsedToolCalls.length > 0) {
-          for (const tc of parsedToolCalls) {
-            const toolCall: ToolCall = {
-              type: "toolCall",
-              id: `toolcall-${crypto.randomUUID()}`,
-              name: tc.name,
-              arguments: tc.arguments,
-            };
-            output.content.push(toolCall);
-            const idx = output.content.length - 1;
-            eventStream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
-            eventStream.push({ type: "toolcall_delta", contentIndex: idx, delta: JSON.stringify(tc.arguments), partial: output });
-            eventStream.push({ type: "toolcall_end", contentIndex: idx, toolCall, partial: output });
+        if (reasoning && !content) {
+          // Response is in reasoning field - need to extract actual response from thinking process
+          // The reasoning typically contains "Thinking Process:\n\n...\n\n**Final Output:** or **Output:** <actual response>"
+          // or just ends with the actual response after the thinking
+          
+          // Try to extract the actual response from the reasoning
+          let actualResponse: string | null = null;
+          let thinkingPart: string | null = null;
+
+          const finalOutputMatch = reasoning.match(/\*\*Final (?:Output|Response|Decision):\*\*\s*\n?\s*"?([^"\n]+)"?/i);
+          const outputMatch = reasoning.match(/\*\*Output:\*\*\s*\n?\s*"?([^"\n]+)"?/i);
+          const decidedMatch = reasoning.match(/\(Decided\)\s*\n?\s*"?([^"\n]+)"?/i);
+
+          if (finalOutputMatch) {
+            thinkingPart = reasoning.substring(0, finalOutputMatch.index);
+            actualResponse = finalOutputMatch[1].trim();
+          } else if (outputMatch) {
+            thinkingPart = reasoning.substring(0, outputMatch.index);
+            actualResponse = outputMatch[1].trim();
+          } else if (decidedMatch) {
+            thinkingPart = reasoning.substring(0, decidedMatch.index);
+            actualResponse = decidedMatch[1].trim();
+          } else {
+            // Check if the reasoning ends with a quoted response
+            const quotedResponseMatch = reasoning.match(/"([^"]+)"\s*$/);
+            if (quotedResponseMatch && reasoning.length - quotedResponseMatch.index! > 100) {
+              actualResponse = quotedResponseMatch[1].trim();
+              thinkingPart = reasoning.substring(0, quotedResponseMatch.index);
+            } else {
+              // Can't separate thinking from response — emit everything as text only.
+              // Emitting as both thinking AND text would duplicate the same content.
+              actualResponse = reasoning;
+              thinkingPart = null;
+            }
           }
-          output.stopReason = "toolUse";
-          eventStream.push({ type: "done", reason: "toolUse", message: output });
-        } else {
-          // Regular text response - strip leading whitespace artifacts
-          const text = message.content.replace(/^\s+/, "");
-          if (text) {
-            output.content.push({ type: "text", text } as TextContent);
+
+          // Emit thinking (only when we found a clear separator)
+          if (thinkingPart && thinkingPart.trim()) {
+            output.content.push({ type: "thinking", thinking: thinkingPart.trim() } as ThinkingContent);
+            const idx = output.content.length - 1;
+            eventStream.push({ type: "thinking_start", contentIndex: idx, partial: output });
+            eventStream.push({ type: "thinking_delta", contentIndex: idx, delta: thinkingPart.trim(), partial: output });
+            eventStream.push({ type: "thinking_end", contentIndex: idx, content: thinkingPart.trim(), partial: output });
+          }
+
+          // Emit actual response as text
+          if (actualResponse && actualResponse.trim()) {
+            output.content.push({ type: "text", text: actualResponse.trim() } as TextContent);
             const idx = output.content.length - 1;
             eventStream.push({ type: "text_start", contentIndex: idx, partial: output });
-            eventStream.push({ type: "text_delta", contentIndex: idx, delta: text, partial: output });
-            eventStream.push({ type: "text_end", contentIndex: idx, content: text, partial: output });
+            eventStream.push({ type: "text_delta", contentIndex: idx, delta: actualResponse.trim(), partial: output });
+            eventStream.push({ type: "text_end", contentIndex: idx, content: actualResponse.trim(), partial: output });
           }
+          
+          output.stopReason = "stop";
+          eventStream.push({ type: "done", reason: "stop", message: output });
+        } else if (content) {
+          // Regular content field response
+          // Emit thinking content if present and non-empty
+          if (reasoning && reasoning.trim()) {
+            output.content.push({ type: "thinking", thinking: reasoning.trim() } as ThinkingContent);
+            const idx = output.content.length - 1;
+            eventStream.push({ type: "thinking_start", contentIndex: idx, partial: output });
+            eventStream.push({ type: "thinking_delta", contentIndex: idx, delta: reasoning.trim(), partial: output });
+            eventStream.push({ type: "thinking_end", contentIndex: idx, content: reasoning.trim(), partial: output });
+          }
+
+          // Parse <tool_call> blocks from text content
+          const parsedToolCalls = parseQwenToolCalls(content);
+
+          if (parsedToolCalls.length > 0) {
+            for (const tc of parsedToolCalls) {
+              const toolCall: ToolCall = {
+                type: "toolCall",
+                id: `toolcall-${crypto.randomUUID()}`,
+                name: tc.name,
+                arguments: tc.arguments,
+              };
+              output.content.push(toolCall);
+              const idx = output.content.length - 1;
+              eventStream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+              eventStream.push({ type: "toolcall_delta", contentIndex: idx, delta: JSON.stringify(tc.arguments), partial: output });
+              eventStream.push({ type: "toolcall_end", contentIndex: idx, toolCall, partial: output });
+            }
+            output.stopReason = "toolUse";
+            eventStream.push({ type: "done", reason: "toolUse", message: output });
+          } else {
+            // Regular text response - strip leading whitespace artifacts
+            const text = content.replace(/^\s+/, "");
+            if (text) {
+              output.content.push({ type: "text", text } as TextContent);
+              const idx = output.content.length - 1;
+              eventStream.push({ type: "text_start", contentIndex: idx, partial: output });
+              eventStream.push({ type: "text_delta", contentIndex: idx, delta: text, partial: output });
+              eventStream.push({ type: "text_end", contentIndex: idx, content: text, partial: output });
+            }
+            output.stopReason = "stop";
+            eventStream.push({ type: "done", reason: "stop", message: output });
+          }
+        } else {
           output.stopReason = "stop";
           eventStream.push({ type: "done", reason: "stop", message: output });
         }
-      } else {
-        output.stopReason = "stop";
-        eventStream.push({ type: "done", reason: "stop", message: output });
       }
 
       eventStream.end();
@@ -529,16 +619,6 @@ export default function (pi: ExtensionAPI) {
         contextWindow: 262000,
         maxTokens: 8192,
         compat: qwenCompat,
-      },
-      {
-        id: "e5-mistral-7b-instruct",
-        name: "E5 Mistral 7B Instruct (Embeddings)",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 4096,
-        maxTokens: 8192,
-        compat: vllmCompat,
       },
     ]
   });
