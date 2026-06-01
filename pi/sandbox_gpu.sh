@@ -59,7 +59,7 @@ bwrap \
   --bind-try "$USER_HOME/.local/share/uv" "$USER_HOME/.local/share/uv" \
   --ro-bind-try "$NVM_DIR_PATH" "$NVM_DIR_PATH" \
   --bind-try "$USER_HOME/.pi" "$USER_HOME/.pi" \
-  --setenv PATH "$NODE_BIN_PATH:$USER_HOME/.local/bin:/usr/bin:/bin:" \
+  --setenv PATH "$NODE_BIN_PATH:$USER_HOME/.local/bin:$USER_HOME/.cargo/bin:/usr/bin:/bin:" \
   --setenv HOME "$USER_HOME" \
   --setenv USER "$CURRENT_USER" \
   --setenv UV_LINK_MODE "copy" \
